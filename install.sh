@@ -189,7 +189,7 @@ def ip_quality(ip: str, cfg: Dict[str, str], state: Dict[str, object]) -> Dict[s
     if ipr_threat:
         fraud_score = 100
     elif proxy_like:
-        fraud_score = 90
+        fraud_score = 20
     else:
         fraud_score = 0
 
@@ -394,7 +394,7 @@ QUALITY_CACHE_TTL_SEC=86400
 IPREGISTRY_API_KEY=${IPREGISTRY_API_KEY}
 REJECT_ONLY_WHEN_PROXY_AND_HIGH_RISK=1
 RISK_SCORE_THRESHOLD=75
-CANDIDATE_LIMIT=20
+CANDIDATE_LIMIT=80
 OPENVPN_CONNECT_WAIT=50
 QUALITY_CHECK_INTERVAL_SEC=3600
 FORCE_SWITCH_INTERVAL_SEC=43200
@@ -430,7 +430,7 @@ TIMEREOF
 
 systemctl daemon-reload
 systemctl enable --now vpngate-rotator.timer
-systemctl start vpngate-rotator.service || true
+systemctl start vpngate-rotator.service >/dev/null 2>&1 || true
 
 echo
 echo "Install finished."
