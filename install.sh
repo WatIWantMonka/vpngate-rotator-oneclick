@@ -344,11 +344,68 @@ def fetch_vpngate_candidates(limit: int) -> List[Dict[str, str]]:
     return out[:limit]
 
 
+def scamalytics_base_url(cfg: Dict[str, str]) -> str:
+    host = cfg.get('SCAMALYTICS_HOSTNAME', '').strip().lower()
+    if not host:
+        return ''
+    if host in ('api11', 'api11.scamalytics.com'):
+        return 'https://api11.scamalytics.com/v3/'
+    if host in ('api12', 'api12.scamalytics.com'):
+        return 'https://api12.scamalytics.com/v3/'
+    raise RuntimeError(f'unsupported SCAMALYTICS_HOSTNAME: {host}')
+
+
+def scamalytics_enabled(cfg: Dict[str, str]) -> bool:
+    return bool(
+        cfg.get('SCAMALYTICS_HOSTNAME', '').strip()
+        and cfg.get('SCAMALYTICS_USERNAME', '').strip()
+        and cfg.get('SCAMALYTICS_KEY', '').strip()
+    )
+
+
+def parse_abuser_level(value: object) -> str:
+    txt = str(value or '').strip()
+    m = re.search(r'\(([^)]+)\)', txt)
+    if m:
+        return m.group(1).strip()
+    return txt
+
+
 def ip_quality(ip: str, cfg: Dict[str, str]) -> Dict[str, object]:
-    # no_cache: always query both databases in realtime
+    # no_cache: always query live data. IP2Location is informational only.
     i2l_url = 'https://api.ip2location.io/?ip=' + urllib.parse.quote(ip, safe='')
     i2l_data = json.loads(http_get(i2l_url, timeout=12))
-    i2l_proxy = bool(i2l_data.get('is_proxy', False))
+
+    ipapi_key = cfg.get('IPAPI_IS_KEY', '').strip()
+    if not ipapi_key:
+        raise RuntimeError('IPAPI_IS_KEY is empty')
+
+    ipapi_url = (
+        'https://api.ipapi.is/?q='
+        + urllib.parse.quote(ip, safe='')
+        + '&key='
+        + urllib.parse.quote(ipapi_key, safe='')
+    )
+    ipapi_data = json.loads(http_get(ipapi_url, timeout=12))
+    ipapi_company = ipapi_data.get('company', {}) if isinstance(ipapi_data, dict) else {}
+    ipapi_asn = ipapi_data.get('asn', {}) if isinstance(ipapi_data, dict) else {}
+
+    ipapi_is_datacenter = bool(ipapi_data.get('is_datacenter', False))
+    ipapi_is_tor = bool(ipapi_data.get('is_tor', False))
+    ipapi_is_vpn = bool(ipapi_data.get('is_vpn', False))
+    ipapi_is_proxy = bool(ipapi_data.get('is_proxy', False))
+    ipapi_is_abuser = bool(ipapi_data.get('is_abuser', False))
+    company_abuser_level = parse_abuser_level(ipapi_company.get('abuser_score', ''))
+    asn_abuser_level = parse_abuser_level(ipapi_asn.get('abuser_score', ''))
+    ipapi_pass = bool(
+        (not ipapi_is_datacenter)
+        and (not ipapi_is_tor)
+        and (not ipapi_is_vpn)
+        and (not ipapi_is_proxy)
+        and (not ipapi_is_abuser)
+        and company_abuser_level == 'Very Low'
+        and asn_abuser_level == 'Very Low'
+    )
 
     ipr_key = cfg.get('IPREGISTRY_API_KEY', '').strip()
     if not ipr_key:
@@ -377,22 +434,63 @@ def ip_quality(ip: str, cfg: Dict[str, str]) -> Dict[str, object]:
 
     conn_type = str(conn.get('type', '') or '').lower()
     company_type = str(company.get('type', '') or '').lower()
+    residential = (conn_type == 'isp') and (not ipr_cloud) and (company_type in ('', 'isp')) and (not ipapi_is_datacenter)
+    ipregistry_flagged = bool(ipr_proxy or ipr_cloud or ipr_threat)
+    ipregistry_pass = bool(residential and (not ipregistry_flagged))
 
-    # Residential heuristic: ISP line, not cloud
-    residential = (conn_type == 'isp') and (not ipr_cloud) and (company_type in ('', 'isp'))
+    prescreen_pass = bool(ipapi_pass and ipregistry_pass)
 
-    flagged = bool(i2l_proxy or ipr_proxy or ipr_cloud or ipr_threat)
+    scam_enabled = scamalytics_enabled(cfg)
+    scam_score: Optional[float] = None
+    scam_risk = ''
+    scam_blocked = False
+
+    if scam_enabled and prescreen_pass:
+        base_url = scamalytics_base_url(cfg)
+        username = cfg.get('SCAMALYTICS_USERNAME', '').strip()
+        scam_key = cfg.get('SCAMALYTICS_KEY', '').strip()
+        scam_url = (
+            base_url
+            + urllib.parse.quote(username, safe='')
+            + '/?key='
+            + urllib.parse.quote(scam_key, safe='')
+            + '&ip='
+            + urllib.parse.quote(ip, safe='')
+        )
+        scam_data = json.loads(http_get(scam_url, timeout=12))
+        score_raw = scam_data.get('score', scam_data.get('fraud_score', 0))
+        try:
+            scam_score = float(score_raw)
+        except (TypeError, ValueError):
+            scam_score = None
+        scam_risk = str(scam_data.get('risk', '') or '')
+        scam_blocked = bool(scam_score is not None and scam_score > 10)
+
+    flagged = bool((not ipapi_pass) or (not ipregistry_pass) or scam_blocked)
 
     return {
         'ip': ip,
         'flagged': flagged,
         'residential': residential,
-        'i2l_proxy': i2l_proxy,
+        'ipapi_pass': ipapi_pass,
+        'ipapi_is_datacenter': ipapi_is_datacenter,
+        'ipapi_is_tor': ipapi_is_tor,
+        'ipapi_is_vpn': ipapi_is_vpn,
+        'ipapi_is_proxy': ipapi_is_proxy,
+        'ipapi_is_abuser': ipapi_is_abuser,
+        'ipapi_company_abuser_level': company_abuser_level,
+        'ipapi_asn_abuser_level': asn_abuser_level,
+        'ipregistry_pass': ipregistry_pass,
+        'prescreen_pass': prescreen_pass,
         'ipr_proxy': ipr_proxy,
         'ipr_cloud': ipr_cloud,
         'ipr_threat': ipr_threat,
         'conn_type': conn_type,
         'company_type': company_type,
+        'scamalytics_enabled': scam_enabled,
+        'scamalytics_score': scam_score,
+        'scamalytics_risk': scam_risk,
+        'scamalytics_blocked': scam_blocked,
         'country_code': i2l_data.get('country_code', ''),
         'country_name': i2l_data.get('country_name', ''),
         'region_name': i2l_data.get('region_name', ''),
@@ -404,12 +502,12 @@ def ip_quality(ip: str, cfg: Dict[str, str]) -> Dict[str, object]:
 
 
 def quality_pass_for_candidate(q: Dict[str, object]) -> bool:
-    return bool(q.get('residential', False) and (not q.get('flagged', True)))
+    return bool(q.get('prescreen_pass', False) and (not q.get('scamalytics_blocked', False)))
 
 
 def quality_pass_for_egress(q: Dict[str, object], cfg: Dict[str, str]) -> bool:
     # Keep same strict policy for all operations
-    return bool(q.get('residential', False) and (not q.get('flagged', True)))
+    return bool(q.get('prescreen_pass', False) and (not q.get('scamalytics_blocked', False)))
 
 
 def fetch_openvpn_profile(candidate: Dict[str, str]) -> str:
@@ -573,9 +671,15 @@ def show_report(cfg: Dict[str, str], state: Dict[str, object], title: str = 'Cur
     print(f'{title:<18}: {ip}')
     print(f'Country/City      : {q.get("country_name","-")} / {q.get("city_name","-")}')
     print(f'ASN               : AS{q.get("asn","-")} {q.get("as_name","-")}')
-    print(f'IP2Location       : is_proxy={q.get("i2l_proxy")}')
+    print('IP2Location       : geo/asn only (not used for quality decision)')
+    print(f'IPAPI.is Flags    : datacenter={q.get("ipapi_is_datacenter")} tor={q.get("ipapi_is_tor")} vpn={q.get("ipapi_is_vpn")} proxy={q.get("ipapi_is_proxy")} abuser={q.get("ipapi_is_abuser")}')
+    print(f'IPAPI.is Scores   : company={q.get("ipapi_company_abuser_level","-")} asn={q.get("ipapi_asn_abuser_level","-")}')
     print(f'IPRegistry Flags  : proxy={q.get("ipr_proxy")} cloud={q.get("ipr_cloud")} threat={q.get("ipr_threat")}')
-    print(f'Residential (IPR) : {residential} (connection.type={q.get("conn_type","-")}, company.type={q.get("company_type","-")})')
+    print(f'Residential Check : {residential} (IPRegistry connection.type={q.get("conn_type","-")}, company.type={q.get("company_type","-")}, IPAPI.is_datacenter={q.get("ipapi_is_datacenter")})')
+    if q.get('scamalytics_enabled'):
+        print(f'Scamalytics       : score={q.get("scamalytics_score")} risk={q.get("scamalytics_risk","-")} blocked={q.get("scamalytics_blocked")}')
+    else:
+        print('Scamalytics       : disabled')
     print(f'Verdict           : {verdict}')
     print('========================================================')
     print('')
@@ -600,8 +704,10 @@ def rotate(cfg: Dict[str, str], state: Dict[str, object], reason: str) -> bool:
                 q = ip_quality(ip, cfg)
                 log(
                     f'candidate ip={ip} residential={q.get("residential")} '
-                    f'i2l_proxy={q.get("i2l_proxy")} ipr_proxy={q.get("ipr_proxy")} '
-                    f'ipr_cloud={q.get("ipr_cloud")} ipr_threat={q.get("ipr_threat")}'
+                    f'ipapi_dc={q.get("ipapi_is_datacenter")} ipapi_abuser={q.get("ipapi_is_abuser")} '
+                    f'company_abuser={q.get("ipapi_company_abuser_level")} asn_abuser={q.get("ipapi_asn_abuser_level")} '
+                    f'ipr_proxy={q.get("ipr_proxy")} ipr_cloud={q.get("ipr_cloud")} ipr_threat={q.get("ipr_threat")} '
+                    f'scam_score={q.get("scamalytics_score")} scam_blocked={q.get("scamalytics_blocked")}'
                 )
                 if not quality_pass_for_candidate(q):
                     continue
@@ -615,7 +721,6 @@ def rotate(cfg: Dict[str, str], state: Dict[str, object], reason: str) -> bool:
             state['current_server_ip'] = ip
             state['current_server_host'] = c.get('hostname', '')
             state['last_switch_at'] = int(time.time())
-            state['last_quality_check_at'] = int(time.time())
             write_state(state)
             log(f'switched to {ip} host={c.get("hostname", "-")}')
             show_report(cfg, state, title='Post-Switch Egress')
@@ -638,9 +743,7 @@ def main() -> int:
         log(f'config missing: {CONFIG_PATH}')
         return 2
 
-    interval = cfg_int(cfg, 'QUALITY_CHECK_INTERVAL_SEC', 3600)
     force_switch_interval = cfg_int(cfg, 'FORCE_SWITCH_INTERVAL_SEC', 43200)
-    quality_enabled = cfg_bool(cfg, 'ENABLE_IP_QUALITY_CHECK', True)
     state = read_state()
 
     if args.report:
@@ -666,24 +769,6 @@ def main() -> int:
 
         if current_server_ip and not node_reachable(current_server_ip):
             return 0 if rotate(cfg, state, 'server_ping_fail') else 1
-
-        if quality_enabled:
-            last_q = int(state.get('last_quality_check_at', 0) or 0)
-            if now - last_q >= interval:
-                egress_ip = get_public_ip()
-                if not egress_ip:
-                    return 0 if rotate(cfg, state, 'egress_ip_unknown') else 1
-                try:
-                    q = ip_quality(egress_ip, cfg)
-                    state['last_quality_check_at'] = now
-                    state['last_egress_quality'] = q
-                    write_state(state)
-                    if not quality_pass_for_egress(q, cfg):
-                        return 0 if rotate(cfg, state, f'egress_quality_bad:{egress_ip}') else 1
-                    log(f'quality pass egress_ip={egress_ip}')
-                except Exception as e:
-                    log(f'quality check failed for egress ip={egress_ip}: {e}')
-                    return 1
 
         log('health check pass')
         return 0
@@ -970,15 +1055,22 @@ chmod 755 "$UNINSTALL_SH"
 
 write_config_files() {
   local ipregistry_key="$1"
-  local api_token="$2"
-  local api_port="$3"
+  local ipapi_key="$2"
+  local scam_host="$3"
+  local scam_username="$4"
+  local scam_key="$5"
+  local api_token="$6"
+  local api_port="$7"
 
   cat >"$ROTATOR_CONF" <<EOF
 ENABLE_IP_QUALITY_CHECK=1
 IPREGISTRY_API_KEY=${ipregistry_key}
+IPAPI_IS_KEY=${ipapi_key}
+SCAMALYTICS_HOSTNAME=${scam_host}
+SCAMALYTICS_USERNAME=${scam_username}
+SCAMALYTICS_KEY=${scam_key}
 CANDIDATE_LIMIT=120
 OPENVPN_CONNECT_WAIT=50
-QUALITY_CHECK_INTERVAL_SEC=3600
 FORCE_SWITCH_INTERVAL_SEC=43200
 EOF
   chmod 640 "$ROTATOR_CONF"
@@ -1080,13 +1172,50 @@ setup_fallback_scheduler() {
 }
 
 install_all() {
-  local ipregistry_key api_token api_port init_sys
+  local ipregistry_key ipapi_key scam_host scam_username scam_key api_token api_port init_sys
 
   read -r -p "Enter IPRegistry API Key: " ipregistry_key
   if [[ -z "$ipregistry_key" ]]; then
     echo "IPRegistry API Key is required."
     exit 1
   fi
+
+  read -r -p "Enter IPAPI.is user key: " ipapi_key
+  if [[ -z "$ipapi_key" ]]; then
+    echo "IPAPI.is user key is required."
+    exit 1
+  fi
+
+  read -r -p "Enter Scamalytics node (api11/api12, leave empty to disable): " scam_host
+  scam_host="${scam_host,,}"
+  case "$scam_host" in
+    "" )
+      scam_username=""
+      scam_key=""
+      ;;
+    api11|api11.scamalytics.com)
+      scam_host="api11.scamalytics.com"
+      read -r -p "Enter Scamalytics username: " scam_username
+      read -r -p "Enter Scamalytics key: " scam_key
+      if [[ -z "$scam_username" || -z "$scam_key" ]]; then
+        echo "Scamalytics username and key are required when a Scamalytics node is set."
+        exit 1
+      fi
+      ;;
+    api12|api12.scamalytics.com)
+      scam_host="api12.scamalytics.com"
+      read -r -p "Enter Scamalytics username: " scam_username
+      read -r -p "Enter Scamalytics key: " scam_key
+      if [[ -z "$scam_username" || -z "$scam_key" ]]; then
+        echo "Scamalytics username and key are required when a Scamalytics node is set."
+        exit 1
+      fi
+      ;;
+    *)
+      echo "Scamalytics node must be api11, api12, api11.scamalytics.com, api12.scamalytics.com, or empty."
+      exit 1
+      ;;
+  esac
 
   read -r -p "Enter API auth token (used by /status and /rotate): " api_token
   if [[ -z "$api_token" ]]; then
@@ -1111,7 +1240,7 @@ install_all() {
   write_api_py
   write_wrapper_bin
   write_uninstall_script
-  write_config_files "$ipregistry_key" "$api_token" "$api_port"
+  write_config_files "$ipregistry_key" "$ipapi_key" "$scam_host" "$scam_username" "$scam_key" "$api_token" "$api_port"
 
   init_sys="$(detect_init_system)"
   case "$init_sys" in
@@ -1136,7 +1265,7 @@ install_all() {
   echo "  vpngate ip"
   echo "  vpngate logs"
   echo
-  echo "Direct API (port 18082):"
+  echo "Direct API (port ${api_port}):"
   echo "  curl -H 'Authorization: Bearer ${api_token}' http://<VPS_IP>:${api_port}/status"
   echo "  curl -X POST -H 'Authorization: Bearer ${api_token}' http://<VPS_IP>:${api_port}/rotate"
 }
