@@ -95,6 +95,7 @@ cat >"$ROTATOR_PY" <<'PYEOF'
 import argparse
 import base64
 import csv
+import html
 import io
 import json
 import os
@@ -111,7 +112,9 @@ STATE_PATH = '/var/lib/vpngate-rotator/state.json'
 OPENVPN_CONFIG_PATH = '/etc/openvpn/vpngate-current.ovpn'
 OPENVPN_PID_PATH = '/run/vpngate-openvpn.pid'
 OPENVPN_LOG_PATH = '/var/log/vpngate-openvpn.log'
+ROTATE_LOCK_PATH = '/run/vpngate-rotate.lock'
 VPNGATE_API = 'https://www.vpngate.net/api/iphone/'
+VPNGATE_LIST = 'https://www.vpngate.net/en/'
 
 
 def log(msg: str) -> None:
@@ -172,6 +175,49 @@ def run(cmd: List[str], timeout: int = 30) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
 
 
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def acquire_rotate_lock() -> bool:
+    try:
+        fd = os.open(ROTATE_LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(str(os.getpid()))
+        return True
+    except FileExistsError:
+        try:
+            with open(ROTATE_LOCK_PATH, 'r', encoding='utf-8') as f:
+                lock_pid = int((f.read() or '0').strip())
+            if lock_pid > 0 and pid_alive(lock_pid):
+                log(f'rotate skipped: another rotator is active pid={lock_pid}')
+                return False
+        except Exception:
+            pass
+        try:
+            os.unlink(ROTATE_LOCK_PATH)
+        except FileNotFoundError:
+            pass
+        fd = os.open(ROTATE_LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(str(os.getpid()))
+        return True
+
+
+def release_rotate_lock() -> None:
+    try:
+        with open(ROTATE_LOCK_PATH, 'r', encoding='utf-8') as f:
+            lock_pid = int((f.read() or '0').strip())
+        if lock_pid == os.getpid():
+            os.unlink(ROTATE_LOCK_PATH)
+    except Exception:
+        pass
+
+
 def get_public_ip() -> Optional[str]:
     # Primary source requested by user: curl -4 ip.sb
     try:
@@ -192,8 +238,7 @@ def get_public_ip() -> Optional[str]:
     return None
 
 
-def fetch_vpngate_candidates(limit: int) -> List[Dict[str, str]]:
-    raw = http_get(VPNGATE_API, timeout=20)
+def parse_csv_candidates(raw: str) -> List[Dict[str, str]]:
     lines = []
     for ln in raw.splitlines():
         if not ln or ln.startswith('*'):
@@ -222,7 +267,78 @@ def fetch_vpngate_candidates(limit: int) -> List[Dict[str, str]]:
             'ip': ip,
             'hostname': (r.get('HostName') or '').strip(),
             'ovpn_b64': ovpn_b64,
+            'source': 'csv',
         })
+    return out
+
+
+def parse_html_candidates(raw: str) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    seen = set()
+
+    for row in re.findall(r'<tr>\s*(.*?)\s*</tr>', raw, flags=re.I | re.S):
+        if 'do_openvpn.aspx' not in row:
+            continue
+
+        country_m = re.search(
+            r"<td[^>]*class='vg_table_row_[01]'[^>]*>.*?<br>\s*([^<]+)\s*</td>",
+            row,
+            flags=re.I | re.S,
+        )
+        host_ip_m = re.search(
+            r"<td[^>]*class='vg_table_row_[01]'[^>]*>\s*<b>.*?<span[^>]*>([^<]+)</span>.*?"
+            r"<br>\s*<span[^>]*>(\d+\.\d+\.\d+\.\d+)</span>",
+            row,
+            flags=re.I | re.S,
+        )
+        config_m = re.search(r"href='(do_openvpn\.aspx\?[^']+)'", row, flags=re.I)
+
+        if not country_m or not host_ip_m or not config_m:
+            continue
+
+        country = html.unescape(country_m.group(1).strip())
+        if country.lower() != 'japan':
+            continue
+
+        hostname = html.unescape(host_ip_m.group(1).strip())
+        ip = host_ip_m.group(2).strip()
+        if ip in seen:
+            continue
+        seen.add(ip)
+
+        out.append({
+            'ip': ip,
+            'hostname': hostname,
+            'config_page_url': urllib.parse.urljoin(VPNGATE_LIST, html.unescape(config_m.group(1))),
+            'source': 'html',
+        })
+
+    return out
+
+
+def fetch_vpngate_candidates(limit: int) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    errors: List[str] = []
+
+    try:
+        raw = http_get(VPNGATE_API, timeout=20)
+        out = parse_csv_candidates(raw)
+        if out:
+            log(f'fetched {len(out)} JP candidates via VPNGate CSV API')
+    except Exception as e:
+        errors.append(f'csv_error={e}')
+
+    if not out:
+        try:
+            raw = http_get(VPNGATE_LIST, timeout=20)
+            out = parse_html_candidates(raw)
+            if out:
+                log(f'fetched {len(out)} JP candidates via VPNGate HTML fallback')
+        except Exception as e:
+            errors.append(f'html_error={e}')
+
+    if not out and errors:
+        log('candidate source errors: ' + '; '.join(errors))
 
     random.SystemRandom().shuffle(out)
     return out[:limit]
@@ -296,13 +412,51 @@ def quality_pass_for_egress(q: Dict[str, object], cfg: Dict[str, str]) -> bool:
     return bool(q.get('residential', False) and (not q.get('flagged', True)))
 
 
+def fetch_openvpn_profile(candidate: Dict[str, str]) -> str:
+    ovpn_b64 = candidate.get('ovpn_b64', '').strip()
+    if ovpn_b64:
+        return base64.b64decode(ovpn_b64).decode('utf-8', errors='ignore')
+
+    config_page_url = candidate.get('config_page_url', '').strip()
+    if not config_page_url:
+        raise RuntimeError('candidate has no OpenVPN config source')
+
+    page = http_get(config_page_url, timeout=20)
+    download_links = re.findall(
+        r"href=['\"]([^'\"]*openvpn_download\.aspx[^'\"]+\.ovpn)['\"]",
+        page,
+        flags=re.I,
+    )
+    if not download_links:
+        raise RuntimeError('OpenVPN download link not found on config page')
+
+    random.SystemRandom().shuffle(download_links)
+    last_error: Optional[str] = None
+    for link in download_links:
+        download_url = urllib.parse.urljoin(VPNGATE_LIST, html.unescape(link))
+        try:
+            profile = http_get(download_url, timeout=20)
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+        if 'client' in profile and 'remote ' in profile:
+            return profile
+        last_error = 'downloaded profile did not look like an OpenVPN client config'
+
+    raise RuntimeError(last_error or 'unable to download OpenVPN profile')
+
+
 def write_openvpn_config(candidate: Dict[str, str]) -> None:
-    decoded = base64.b64decode(candidate['ovpn_b64']).decode('utf-8', errors='ignore')
+    decoded = fetch_openvpn_profile(candidate)
     extra = """
 script-security 2
 verb 3
 ping 10
 ping-restart 30
+data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305:AES-128-CBC
+data-ciphers-fallback AES-128-CBC
+auth-nocache
 """
     os.makedirs(os.path.dirname(OPENVPN_CONFIG_PATH), exist_ok=True)
     with open(OPENVPN_CONFIG_PATH, 'w', encoding='utf-8') as f:
@@ -311,15 +465,34 @@ ping-restart 30
 
 
 def stop_openvpn() -> None:
+    pid = None
     if os.path.exists(OPENVPN_PID_PATH):
         try:
             with open(OPENVPN_PID_PATH, 'r', encoding='utf-8') as f:
                 pid = int(f.read().strip())
+        except Exception:
+            pid = None
+
+    if pid and pid_alive(pid):
+        try:
             os.kill(pid, 15)
-            time.sleep(2)
         except Exception:
             pass
-    run(['pkill', '-f', f'openvpn --config {OPENVPN_CONFIG_PATH}'], timeout=5)
+
+    run(['pkill', '-TERM', '-f', f'openvpn --config {OPENVPN_CONFIG_PATH}'], timeout=5)
+
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        if not pid or not pid_alive(pid):
+            break
+        time.sleep(0.5)
+
+    run(['pkill', '-KILL', '-f', f'openvpn --config {OPENVPN_CONFIG_PATH}'], timeout=5)
+
+    try:
+        os.unlink(OPENVPN_PID_PATH)
+    except FileNotFoundError:
+        pass
 
 
 def is_process_alive() -> bool:
@@ -357,7 +530,15 @@ def start_openvpn_and_wait(wait_seconds: int) -> bool:
                 txt = f.read()
             if 'Initialization Sequence Completed' in txt:
                 return True
-            if 'AUTH_FAILED' in txt or 'Exiting due to fatal error' in txt:
+            fatal_markers = (
+                'AUTH_FAILED',
+                'Exiting due to fatal error',
+                'failed to negotiate cipher with server',
+                'process-push-msg-failed',
+                'Cannot open TUN/TAP dev',
+                'All connections have been connect-retry-max exhausted',
+            )
+            if any(marker in txt for marker in fatal_markers):
                 return False
         except Exception:
             pass
@@ -466,42 +647,48 @@ def main() -> int:
         show_report(cfg, state, title='Manual Report')
         return 0
 
-    if args.force_rotate:
-        return 0 if rotate(cfg, state, 'api_force_rotate') else 1
+    if not acquire_rotate_lock():
+        return 0
 
-    current_server_ip = str(state.get('current_server_ip', ''))
-    now = int(time.time())
+    try:
+        if args.force_rotate:
+            return 0 if rotate(cfg, state, 'api_force_rotate') else 1
 
-    if not is_process_alive():
-        return 0 if rotate(cfg, state, 'openvpn_process_down') else 1
+        current_server_ip = str(state.get('current_server_ip', ''))
+        now = int(time.time())
 
-    last_switch = int(state.get('last_switch_at', 0) or 0)
-    if force_switch_interval > 0 and last_switch > 0 and now - last_switch >= force_switch_interval:
-        return 0 if rotate(cfg, state, f'force_interval_elapsed:{force_switch_interval}s') else 1
+        if not is_process_alive():
+            return 0 if rotate(cfg, state, 'openvpn_process_down') else 1
 
-    if current_server_ip and not node_reachable(current_server_ip):
-        return 0 if rotate(cfg, state, 'server_ping_fail') else 1
+        last_switch = int(state.get('last_switch_at', 0) or 0)
+        if force_switch_interval > 0 and last_switch > 0 and now - last_switch >= force_switch_interval:
+            return 0 if rotate(cfg, state, f'force_interval_elapsed:{force_switch_interval}s') else 1
 
-    if quality_enabled:
-        last_q = int(state.get('last_quality_check_at', 0) or 0)
-        if now - last_q >= interval:
-            egress_ip = get_public_ip()
-            if not egress_ip:
-                return 0 if rotate(cfg, state, 'egress_ip_unknown') else 1
-            try:
-                q = ip_quality(egress_ip, cfg)
-                state['last_quality_check_at'] = now
-                state['last_egress_quality'] = q
-                write_state(state)
-                if not quality_pass_for_egress(q, cfg):
-                    return 0 if rotate(cfg, state, f'egress_quality_bad:{egress_ip}') else 1
-                log(f'quality pass egress_ip={egress_ip}')
-            except Exception as e:
-                log(f'quality check failed for egress ip={egress_ip}: {e}')
-                return 1
+        if current_server_ip and not node_reachable(current_server_ip):
+            return 0 if rotate(cfg, state, 'server_ping_fail') else 1
 
-    log('health check pass')
-    return 0
+        if quality_enabled:
+            last_q = int(state.get('last_quality_check_at', 0) or 0)
+            if now - last_q >= interval:
+                egress_ip = get_public_ip()
+                if not egress_ip:
+                    return 0 if rotate(cfg, state, 'egress_ip_unknown') else 1
+                try:
+                    q = ip_quality(egress_ip, cfg)
+                    state['last_quality_check_at'] = now
+                    state['last_egress_quality'] = q
+                    write_state(state)
+                    if not quality_pass_for_egress(q, cfg):
+                        return 0 if rotate(cfg, state, f'egress_quality_bad:{egress_ip}') else 1
+                    log(f'quality pass egress_ip={egress_ip}')
+                except Exception as e:
+                    log(f'quality check failed for egress ip={egress_ip}: {e}')
+                    return 1
+
+        log('health check pass')
+        return 0
+    finally:
+        release_rotate_lock()
 
 
 if __name__ == '__main__':
@@ -757,6 +944,11 @@ fi
 
 rm -f "$SYSTEMD_ROTATOR_SERVICE" "$SYSTEMD_ROTATOR_TIMER" "$SYSTEMD_API_SERVICE"
 rm -f "$OPENRC_API_SERVICE" "$OPENRC_PERIODIC"
+
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl reset-failed >/dev/null 2>&1 || true
+fi
 
 if command -v crontab >/dev/null 2>&1; then
   crontab -l 2>/dev/null | grep -v "$CRON_MARK" | crontab - || true
