@@ -238,6 +238,23 @@ def get_public_ip() -> Optional[str]:
     return None
 
 
+def has_ipv4_connectivity(timeout_sec: int = 4) -> bool:
+    probes = (
+        ['curl', '-4', '-sS', '--max-time', str(timeout_sec), 'https://api.ipify.org'],
+        ['curl', '-4', '-sS', '--max-time', str(timeout_sec), 'https://ifconfig.me/ip'],
+        ['curl', '-4', '-sS', '--max-time', str(timeout_sec), 'https://icanhazip.com'],
+    )
+    for cmd in probes:
+        try:
+            cp = run(cmd, timeout=timeout_sec + 2)
+            ip = (cp.stdout or '').strip()
+            if cp.returncode == 0 and re.match(r'^\d+\.\d+\.\d+\.\d+$', ip):
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def parse_csv_candidates(raw: str) -> List[Dict[str, str]]:
     lines = []
     for ln in raw.splitlines():
@@ -593,6 +610,19 @@ def stop_openvpn() -> None:
         pass
 
 
+def rescue_if_tunnel_blackhole(state: Dict[str, object]) -> bool:
+    if not is_process_alive():
+        return False
+    if has_ipv4_connectivity(timeout_sec=4):
+        return False
+    log('detected tunnel blackhole: openvpn is up but IPv4 egress is down, forcing tunnel teardown')
+    stop_openvpn()
+    state['last_recovery_at'] = int(time.time())
+    state['last_recovery_reason'] = 'tunnel_blackhole'
+    write_state(state)
+    return True
+
+
 def is_process_alive() -> bool:
     if not os.path.exists(OPENVPN_PID_PATH):
         return False
@@ -692,6 +722,11 @@ def rotate(cfg: Dict[str, str], state: Dict[str, object], reason: str) -> bool:
 
     log(f'rotate reason={reason}')
     candidates = fetch_vpngate_candidates(limit)
+    if not candidates and is_process_alive():
+        log('candidate fetch failed while tunnel is active, tearing down tunnel and retrying candidate fetch')
+        stop_openvpn()
+        time.sleep(1)
+        candidates = fetch_vpngate_candidates(limit)
     if not candidates:
         log('no JP candidates from VPNGate')
         return False
@@ -754,6 +789,8 @@ def main() -> int:
         return 0
 
     try:
+        rescue_if_tunnel_blackhole(state)
+
         if args.force_rotate:
             return 0 if rotate(cfg, state, 'api_force_rotate') else 1
 
