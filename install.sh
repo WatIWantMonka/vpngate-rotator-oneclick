@@ -101,6 +101,8 @@ import json
 import os
 import random
 import re
+import socket
+from collections import Counter
 import subprocess
 import time
 import urllib.parse
@@ -272,8 +274,6 @@ def parse_csv_candidates(raw: str) -> List[Dict[str, str]]:
     rows = list(csv.DictReader(io.StringIO(chr(10).join(lines))))
     out: List[Dict[str, str]] = []
     for r in rows:
-        if (r.get('CountryShort') or '').upper() != 'JP':
-            continue
         ip = (r.get('IP') or '').strip()
         ovpn_b64 = (r.get('OpenVPN_ConfigData_Base64') or '').strip()
         if not ip or not ovpn_b64:
@@ -284,6 +284,8 @@ def parse_csv_candidates(raw: str) -> List[Dict[str, str]]:
             'ip': ip,
             'hostname': (r.get('HostName') or '').strip(),
             'ovpn_b64': ovpn_b64,
+            'country_code': (r.get('CountryShort') or '').strip().upper(),
+            'country_name': (r.get('CountryLong') or '').strip(),
             'source': 'csv',
         })
     return out
@@ -298,7 +300,7 @@ def parse_html_candidates(raw: str) -> List[Dict[str, str]]:
             continue
 
         country_m = re.search(
-            r"<td[^>]*class='vg_table_row_[01]'[^>]*>.*?<br>\s*([^<]+)\s*</td>",
+            r"<img[^>]+flags/([A-Za-z]{2})\.png[^>]*>\s*<br>\s*([^<]+)",
             row,
             flags=re.I | re.S,
         )
@@ -313,10 +315,8 @@ def parse_html_candidates(raw: str) -> List[Dict[str, str]]:
         if not country_m or not host_ip_m or not config_m:
             continue
 
-        country = html.unescape(country_m.group(1).strip())
-        if country.lower() != 'japan':
-            continue
-
+        country_code = country_m.group(1).strip().upper()
+        country_name = html.unescape(country_m.group(2).strip())
         hostname = html.unescape(host_ip_m.group(1).strip())
         ip = host_ip_m.group(2).strip()
         if ip in seen:
@@ -326,6 +326,8 @@ def parse_html_candidates(raw: str) -> List[Dict[str, str]]:
         out.append({
             'ip': ip,
             'hostname': hostname,
+            'country_code': country_code,
+            'country_name': country_name,
             'config_page_url': urllib.parse.urljoin(VPNGATE_LIST, html.unescape(config_m.group(1))),
             'source': 'html',
         })
@@ -333,7 +335,42 @@ def parse_html_candidates(raw: str) -> List[Dict[str, str]]:
     return out
 
 
-def fetch_vpngate_candidates(limit: int) -> List[Dict[str, str]]:
+def target_pool_mode(cfg: Dict[str, str]) -> str:
+    mode = (cfg.get('TARGET_POOL_MODE', 'jp') or 'jp').strip().lower()
+    return mode if mode in ('jp', 'custom') else 'jp'
+
+
+def target_country_codes(cfg: Dict[str, str]) -> List[str]:
+    if target_pool_mode(cfg) == 'jp':
+        return ['JP']
+    raw = str(cfg.get('TARGET_COUNTRY_CODES', '') or '')
+    codes = [part.strip().upper() for part in raw.split(',') if part.strip()]
+    return codes or ['JP']
+
+
+def target_city_keywords(cfg: Dict[str, str]) -> List[str]:
+    raw = str(cfg.get('TARGET_CITY_KEYWORDS', '') or '')
+    return [part.strip().lower() for part in raw.split(',') if part.strip()]
+
+
+def geo_matches_city_pool(q: Dict[str, object], cfg: Dict[str, str]) -> bool:
+    keywords = target_city_keywords(cfg)
+    if not keywords:
+        return True
+    city = str(q.get('city_name', '') or '').lower()
+    region = str(q.get('region_name', '') or '').lower()
+    for kw in keywords:
+        if kw and (kw in city or kw in region):
+            return True
+    return False
+
+
+def filter_candidates_for_target(candidates: List[Dict[str, str]], cfg: Dict[str, str]) -> List[Dict[str, str]]:
+    allowed = set(target_country_codes(cfg))
+    return [c for c in candidates if (c.get('country_code', '') or '').upper() in allowed]
+
+
+def load_vpngate_source_candidates() -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
     errors: List[str] = []
 
@@ -341,7 +378,7 @@ def fetch_vpngate_candidates(limit: int) -> List[Dict[str, str]]:
         raw = http_get(VPNGATE_API, timeout=20)
         out = parse_csv_candidates(raw)
         if out:
-            log(f'fetched {len(out)} JP candidates via VPNGate CSV API')
+            log(f'fetched {len(out)} VPNGate candidates via CSV API')
     except Exception as e:
         errors.append(f'csv_error={e}')
 
@@ -350,15 +387,39 @@ def fetch_vpngate_candidates(limit: int) -> List[Dict[str, str]]:
             raw = http_get(VPNGATE_LIST, timeout=20)
             out = parse_html_candidates(raw)
             if out:
-                log(f'fetched {len(out)} JP candidates via VPNGate HTML fallback')
+                log(f'fetched {len(out)} VPNGate candidates via HTML fallback')
         except Exception as e:
             errors.append(f'html_error={e}')
 
     if not out and errors:
         log('candidate source errors: ' + '; '.join(errors))
 
+    return out
+
+
+def fetch_vpngate_candidates(limit: int, cfg: Dict[str, str]) -> List[Dict[str, str]]:
+    out = filter_candidates_for_target(load_vpngate_source_candidates(), cfg)
     random.SystemRandom().shuffle(out)
     return out[:limit]
+
+
+def list_available_regions() -> int:
+    candidates = load_vpngate_source_candidates()
+    if not candidates:
+        print('No VPNGate regions available right now.')
+        return 1
+
+    counts: Counter[tuple[str, str]] = Counter()
+    for c in candidates:
+        code = (c.get('country_code', '') or '').upper()
+        name = c.get('country_name', '') or code
+        if code:
+            counts[(code, name)] += 1
+
+    print('Available VPNGate country pools:')
+    for (code, name), count in sorted(counts.items(), key=lambda item: (-item[1], item[0][0])):
+        print(f'  {code:<2}  {name:<24} {count}')
+    return 0
 
 
 def scamalytics_base_url(cfg: Dict[str, str]) -> str:
@@ -390,8 +451,14 @@ def parse_abuser_level(value: object) -> str:
 
 def ip_quality(ip: str, cfg: Dict[str, str]) -> Dict[str, object]:
     # no_cache: always query live data. IP2Location is informational only.
+    i2l_data: Dict[str, object] = {}
     i2l_url = 'https://api.ip2location.io/?ip=' + urllib.parse.quote(ip, safe='')
-    i2l_data = json.loads(http_get(i2l_url, timeout=12))
+    try:
+        i2l_raw = json.loads(http_get(i2l_url, timeout=12))
+        if isinstance(i2l_raw, dict):
+            i2l_data = i2l_raw
+    except Exception as e:
+        log(f'ip2location lookup failed for {ip}: {e}')
 
     ipapi_key = cfg.get('IPAPI_IS_KEY', '').strip()
     if not ipapi_key:
@@ -518,13 +585,13 @@ def ip_quality(ip: str, cfg: Dict[str, str]) -> Dict[str, object]:
     }
 
 
-def quality_pass_for_candidate(q: Dict[str, object]) -> bool:
-    return bool(q.get('prescreen_pass', False) and (not q.get('scamalytics_blocked', False)))
+def quality_pass_for_candidate(q: Dict[str, object], cfg: Dict[str, str]) -> bool:
+    return bool(q.get('prescreen_pass', False) and (not q.get('scamalytics_blocked', False)) and geo_matches_city_pool(q, cfg))
 
 
 def quality_pass_for_egress(q: Dict[str, object], cfg: Dict[str, str]) -> bool:
     # Keep same strict policy for all operations
-    return bool(q.get('prescreen_pass', False) and (not q.get('scamalytics_blocked', False)))
+    return bool(q.get('prescreen_pass', False) and (not q.get('scamalytics_blocked', False)) and geo_matches_city_pool(q, cfg))
 
 
 def fetch_openvpn_profile(candidate: Dict[str, str]) -> str:
@@ -675,8 +742,13 @@ def start_openvpn_and_wait(wait_seconds: int) -> bool:
 
 
 def node_reachable(ip: str) -> bool:
-    cp = run(['ping', '-c', '2', '-W', '2', ip], timeout=10)
-    return cp.returncode == 0
+    for port in (443, 1194):
+        try:
+            with socket.create_connection((ip, port), timeout=3):
+                return True
+        except OSError:
+            pass
+    return False
 
 
 def show_report(cfg: Dict[str, str], state: Dict[str, object], title: str = 'Current Egress') -> None:
@@ -700,6 +772,9 @@ def show_report(cfg: Dict[str, str], state: Dict[str, object], title: str = 'Cur
     print('================ VPNGate Rotate Result ================')
     print(f'{title:<18}: {ip}')
     print(f'Country/City      : {q.get("country_name","-")} / {q.get("city_name","-")}')
+    countries = ','.join(target_country_codes(cfg))
+    cities = cfg.get("TARGET_CITY_KEYWORDS", "any") or "any"
+    print(f'Target Pool       : countries={countries} cities={cities}')
     print(f'ASN               : AS{q.get("asn","-")} {q.get("as_name","-")}')
     print('IP2Location       : geo/asn only (not used for quality decision)')
     print(f'IPAPI.is Flags    : datacenter={q.get("ipapi_is_datacenter")} tor={q.get("ipapi_is_tor")} vpn={q.get("ipapi_is_vpn")} proxy={q.get("ipapi_is_proxy")} abuser={q.get("ipapi_is_abuser")}')
@@ -721,12 +796,12 @@ def rotate(cfg: Dict[str, str], state: Dict[str, object], reason: str) -> bool:
     quality_enabled = cfg_bool(cfg, 'ENABLE_IP_QUALITY_CHECK', True)
 
     log(f'rotate reason={reason}')
-    candidates = fetch_vpngate_candidates(limit)
+    candidates = fetch_vpngate_candidates(limit, cfg)
     if not candidates and is_process_alive():
         log('candidate fetch failed while tunnel is active, tearing down tunnel and retrying candidate fetch')
         stop_openvpn()
         time.sleep(1)
-        candidates = fetch_vpngate_candidates(limit)
+        candidates = fetch_vpngate_candidates(limit, cfg)
     if not candidates:
         log('no JP candidates from VPNGate')
         return False
@@ -738,13 +813,14 @@ def rotate(cfg: Dict[str, str], state: Dict[str, object], reason: str) -> bool:
             try:
                 q = ip_quality(ip, cfg)
                 log(
-                    f'candidate ip={ip} residential={q.get("residential")} '
+                    f'candidate ip={ip} country={c.get("country_code", "?")} residential={q.get("residential")} '
+                    f'city={q.get("city_name", "-")} region={q.get("region_name", "-")} '
                     f'ipapi_dc={q.get("ipapi_is_datacenter")} ipapi_abuser={q.get("ipapi_is_abuser")} '
                     f'company_abuser={q.get("ipapi_company_abuser_level")} asn_abuser={q.get("ipapi_asn_abuser_level")} '
                     f'ipr_proxy={q.get("ipr_proxy")} ipr_cloud={q.get("ipr_cloud")} ipr_threat={q.get("ipr_threat")} '
-                    f'scam_score={q.get("scamalytics_score")} scam_blocked={q.get("scamalytics_blocked")}'
+                    f'scam_score={q.get("scamalytics_score")} scam_blocked={q.get("scamalytics_blocked")} city_match={geo_matches_city_pool(q, cfg)}'
                 )
-                if not quality_pass_for_candidate(q):
+                if not quality_pass_for_candidate(q, cfg):
                     continue
             except Exception as e:
                 log(f'skip candidate {ip}, quality_error={e}')
@@ -771,6 +847,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument('--force-rotate', action='store_true')
     ap.add_argument('--report', action='store_true')
+    ap.add_argument('--list-regions', action='store_true')
     args, _ = ap.parse_known_args()
 
     cfg = load_config(CONFIG_PATH)
@@ -784,6 +861,9 @@ def main() -> int:
     if args.report:
         show_report(cfg, state, title='Manual Report')
         return 0
+
+    if args.list_regions:
+        return list_available_regions()
 
     if not acquire_rotate_lock():
         return 0
@@ -925,7 +1005,7 @@ class H(BaseHTTPRequestHandler):
 
 def main():
     cfg = load_conf()
-    host = cfg.get('API_BIND', '0.0.0.0')
+    host = cfg.get('API_BIND', '127.0.0.1')
     port = int(cfg.get('API_PORT', '18082') or '18082')
     srv = ThreadingHTTPServer((host, port), H)
     srv.serve_forever()
@@ -942,17 +1022,51 @@ cat >"$WRAPPER_BIN" <<'SHEOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
+ROTATOR_CONF="/etc/vpngate-rotator.conf"
 API_CONF="/etc/vpngate-rotator-api.conf"
 ROTATOR_PY="/usr/local/sbin/vpngate-jp-rotator.py"
 UNINSTALL_SH="/usr/local/sbin/vpngate-uninstall.sh"
 
 get_conf() {
   local key="$1"
-  awk -F= -v k="$key" '$1==k{print $2}' "$API_CONF" | tail -n 1
+  local file="$2"
+  awk -v k="$key" 'index($0, k "=") == 1 { print substr($0, length(k) + 2) }' "$file" | tail -n 1
+}
+
+set_conf() {
+  local file="$1"
+  local key="$2"
+  local value="$3"
+  local tmp
+  tmp="$(mktemp)"
+  awk -v k="$key" -v v="$value" '
+    BEGIN { done = 0 }
+    index($0, k "=") == 1 { print k "=" v; done = 1; next }
+    { print }
+    END { if (!done) print k "=" v }
+  ' "$file" >"$tmp"
+  cat "$tmp" >"$file"
+  rm -f "$tmp"
+}
+
+mask_value() {
+  local value="$1"
+  local len=${#value}
+  if (( len <= 4 )); then
+    printf '%s\n' "$value"
+    return
+  fi
+  printf '***%s\n' "${value:len-4}"
+}
+
+restart_api_service() {
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl restart vpngate-rotator-api.service >/dev/null 2>&1 || true
+  fi
 }
 
 require_installed() {
-  if [[ ! -f "$API_CONF" ]] || [[ ! -f "$ROTATOR_PY" ]]; then
+  if [[ ! -f "$API_CONF" ]] || [[ ! -f "$ROTATOR_PY" ]] || [[ ! -f "$ROTATOR_CONF" ]]; then
     echo "vpngate is not installed. Run: sudo bash install.sh"
     exit 1
   fi
@@ -961,20 +1075,25 @@ require_installed() {
 cmd_help() {
   cat <<EOF
 vpngate commands:
-  vpngate status      Show current rotator state
-  vpngate rotate      Force rotate to a new JP residential-style IP
-  vpngate ip          Show current egress IP quality report
-  vpngate logs        Show recent service logs
-  vpngate token       Print configured API token
-  vpngate uninstall   Uninstall vpngate rotator
+  vpngate status           Show current rotator state
+  vpngate rotate           Force rotate to a new node from the selected pool
+  vpngate ip               Show current egress IP quality report
+  vpngate logs             Show recent service logs
+  vpngate token            Print configured API token
+  vpngate regions          Show currently available VPNGate country pools
+  vpngate settings         Show current settings summary
+  vpngate settings region  Reconfigure target countries and city filters
+  vpngate settings keys    Reconfigure IP quality API keys
+  vpngate settings api     Reconfigure API token and port
+  vpngate uninstall        Uninstall vpngate rotator
 EOF
 }
 
 cmd_status() {
   require_installed
   local token port
-  token="$(get_conf API_TOKEN)"
-  port="$(get_conf API_PORT)"
+  token="$(get_conf API_TOKEN "$API_CONF")"
+  port="$(get_conf API_PORT "$API_CONF")"
   curl -s -H "Authorization: Bearer ${token}" "http://127.0.0.1:${port}/status"
   echo
 }
@@ -982,8 +1101,8 @@ cmd_status() {
 cmd_rotate() {
   require_installed
   local token port
-  token="$(get_conf API_TOKEN)"
-  port="$(get_conf API_PORT)"
+  token="$(get_conf API_TOKEN "$API_CONF")"
+  port="$(get_conf API_PORT "$API_CONF")"
   curl -s -X POST -H "Authorization: Bearer ${token}" "http://127.0.0.1:${port}/rotate"
   echo
 }
@@ -1003,7 +1122,153 @@ cmd_logs() {
 
 cmd_token() {
   require_installed
-  echo "$(get_conf API_TOKEN)"
+  echo "$(get_conf API_TOKEN "$API_CONF")"
+}
+
+cmd_regions() {
+  require_installed
+  python3 "$ROTATOR_PY" --list-regions
+}
+
+cmd_settings_show() {
+  require_installed
+  echo "TARGET_POOL_MODE=$(get_conf TARGET_POOL_MODE "$ROTATOR_CONF")"
+  echo "TARGET_COUNTRY_CODES=$(get_conf TARGET_COUNTRY_CODES "$ROTATOR_CONF")"
+  echo "TARGET_CITY_KEYWORDS=$(get_conf TARGET_CITY_KEYWORDS "$ROTATOR_CONF")"
+  echo "IPREGISTRY_API_KEY=$(mask_value "$(get_conf IPREGISTRY_API_KEY "$ROTATOR_CONF")")"
+  echo "IPAPI_IS_KEY=$(mask_value "$(get_conf IPAPI_IS_KEY "$ROTATOR_CONF")")"
+  echo "SCAMALYTICS_HOSTNAME=$(get_conf SCAMALYTICS_HOSTNAME "$ROTATOR_CONF")"
+  echo "SCAMALYTICS_USERNAME=$(get_conf SCAMALYTICS_USERNAME "$ROTATOR_CONF")"
+  echo "SCAMALYTICS_KEY=$(mask_value "$(get_conf SCAMALYTICS_KEY "$ROTATOR_CONF")")"
+  echo "API_BIND=$(get_conf API_BIND "$API_CONF")"
+  echo "API_PORT=$(get_conf API_PORT "$API_CONF")"
+  echo "API_TOKEN=$(mask_value "$(get_conf API_TOKEN "$API_CONF")")"
+}
+
+cmd_settings_region() {
+  require_installed
+  local mode countries cities
+  read -r -p "Target pool mode [jp/custom] (default jp): " mode
+  mode="${mode,,}"
+  mode="${mode:-jp}"
+  case "$mode" in
+    jp)
+      countries="JP"
+      ;;
+    custom)
+      if ! python3 "$ROTATOR_PY" --list-regions; then
+        echo "Retrying VPNGate region listing once..."
+        python3 "$ROTATOR_PY" --list-regions || true
+      fi
+      read -r -p "Enter target country codes (comma-separated, example JP,KR,US): " countries
+      if [[ -z "$countries" ]]; then
+        echo "Target country codes are required in custom mode."
+        exit 1
+      fi
+      countries="$(echo "$countries" | tr '[:lower:]' '[:upper:]' | tr -d ' ')"
+      ;;
+    *)
+      echo "Mode must be jp or custom."
+      exit 1
+      ;;
+  esac
+  read -r -p "Enter target cities/regions (comma-separated, leave empty for any city): " cities
+  cities="$(echo "$cities" | sed 's/, */,/g')"
+  set_conf "$ROTATOR_CONF" TARGET_POOL_MODE "$mode"
+  set_conf "$ROTATOR_CONF" TARGET_COUNTRY_CODES "$countries"
+  set_conf "$ROTATOR_CONF" TARGET_CITY_KEYWORDS "$cities"
+  echo "Region settings updated."
+}
+
+cmd_settings_keys() {
+  require_installed
+  local ipregistry ipapi scam_host scam_user scam_key current
+  read -r -p "Enter IPRegistry API key (leave empty to keep current): " ipregistry
+  if [[ -n "$ipregistry" ]]; then
+    set_conf "$ROTATOR_CONF" IPREGISTRY_API_KEY "$ipregistry"
+  fi
+
+  read -r -p "Enter IPAPI.is user key (leave empty to keep current): " ipapi
+  if [[ -n "$ipapi" ]]; then
+    set_conf "$ROTATOR_CONF" IPAPI_IS_KEY "$ipapi"
+  fi
+
+  current="$(get_conf SCAMALYTICS_HOSTNAME "$ROTATOR_CONF")"
+  read -r -p "Enter Scamalytics node [api11/api12/none] (leave empty to keep current: ${current:-disabled}): " scam_host
+  scam_host="${scam_host,,}"
+  case "$scam_host" in
+    "")
+      ;;
+    none)
+      set_conf "$ROTATOR_CONF" SCAMALYTICS_HOSTNAME ""
+      set_conf "$ROTATOR_CONF" SCAMALYTICS_USERNAME ""
+      set_conf "$ROTATOR_CONF" SCAMALYTICS_KEY ""
+      ;;
+    api11|api11.scamalytics.com)
+      read -r -p "Enter Scamalytics username: " scam_user
+      read -rs -p "Enter Scamalytics key: " scam_key
+      echo
+      if [[ -z "$scam_user" || -z "$scam_key" ]]; then
+        echo "Scamalytics username and key are required when enabling Scamalytics."
+        exit 1
+      fi
+      set_conf "$ROTATOR_CONF" SCAMALYTICS_HOSTNAME "api11.scamalytics.com"
+      set_conf "$ROTATOR_CONF" SCAMALYTICS_USERNAME "$scam_user"
+      set_conf "$ROTATOR_CONF" SCAMALYTICS_KEY "$scam_key"
+      ;;
+    api12|api12.scamalytics.com)
+      read -r -p "Enter Scamalytics username: " scam_user
+      read -rs -p "Enter Scamalytics key: " scam_key
+      echo
+      if [[ -z "$scam_user" || -z "$scam_key" ]]; then
+        echo "Scamalytics username and key are required when enabling Scamalytics."
+        exit 1
+      fi
+      set_conf "$ROTATOR_CONF" SCAMALYTICS_HOSTNAME "api12.scamalytics.com"
+      set_conf "$ROTATOR_CONF" SCAMALYTICS_USERNAME "$scam_user"
+      set_conf "$ROTATOR_CONF" SCAMALYTICS_KEY "$scam_key"
+      ;;
+    *)
+      echo "Scamalytics node must be api11, api12, none, or empty."
+      exit 1
+      ;;
+  esac
+  echo "API key settings updated."
+}
+
+cmd_settings_api() {
+  require_installed
+  local token port current_port
+  read -rs -p "Enter new API token (leave empty to keep current): " token
+  echo
+  if [[ -n "$token" ]]; then
+    set_conf "$API_CONF" API_TOKEN "$token"
+  fi
+  current_port="$(get_conf API_PORT "$API_CONF")"
+  read -r -p "Enter new API port (leave empty to keep current: ${current_port}): " port
+  if [[ -n "$port" ]]; then
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+      echo "API port must be an integer between 1 and 65535."
+      exit 1
+    fi
+    set_conf "$API_CONF" API_PORT "$port"
+  fi
+  restart_api_service
+  echo "API settings updated."
+}
+
+cmd_settings() {
+  case "${2:-show}" in
+    show) cmd_settings_show ;;
+    region) cmd_settings_region ;;
+    keys) cmd_settings_keys ;;
+    api) cmd_settings_api ;;
+    *)
+      echo "Unknown settings subcommand: ${2:-}"
+      echo "Use: vpngate settings [show|region|keys|api]"
+      exit 1
+      ;;
+  esac
 }
 
 cmd_uninstall() {
@@ -1021,6 +1286,8 @@ case "${1:-help}" in
   ip) cmd_ip ;;
   logs) cmd_logs ;;
   token) cmd_token ;;
+  regions) cmd_regions ;;
+  settings) cmd_settings "$@" ;;
   uninstall) cmd_uninstall ;;
   help|--help|-h) cmd_help ;;
   *)
@@ -1091,16 +1358,22 @@ chmod 755 "$UNINSTALL_SH"
 }
 
 write_config_files() {
-  local ipregistry_key="$1"
-  local ipapi_key="$2"
-  local scam_host="$3"
-  local scam_username="$4"
-  local scam_key="$5"
-  local api_token="$6"
-  local api_port="$7"
+  local target_mode="$1"
+  local target_country_codes="$2"
+  local target_city_keywords="$3"
+  local ipregistry_key="$4"
+  local ipapi_key="$5"
+  local scam_host="$6"
+  local scam_username="$7"
+  local scam_key="$8"
+  local api_token="$9"
+  local api_port="${10}"
 
   cat >"$ROTATOR_CONF" <<EOF
 ENABLE_IP_QUALITY_CHECK=1
+TARGET_POOL_MODE=${target_mode}
+TARGET_COUNTRY_CODES=${target_country_codes}
+TARGET_CITY_KEYWORDS=${target_city_keywords}
 IPREGISTRY_API_KEY=${ipregistry_key}
 IPAPI_IS_KEY=${ipapi_key}
 SCAMALYTICS_HOSTNAME=${scam_host}
@@ -1114,7 +1387,7 @@ EOF
 
   cat >"$API_CONF" <<EOF
 API_TOKEN=${api_token}
-API_BIND=0.0.0.0
+API_BIND=127.0.0.1
 API_PORT=${api_port}
 API_COOLDOWN_SEC=20
 EOF
@@ -1209,7 +1482,45 @@ setup_fallback_scheduler() {
 }
 
 install_all() {
+  local target_mode target_country_codes target_city_keywords
   local ipregistry_key ipapi_key scam_host scam_username scam_key api_token api_port init_sys
+
+  read -r -p "Target pool mode [jp/custom] (default jp): " target_mode
+  target_mode="${target_mode,,}"
+  target_mode="${target_mode:-jp}"
+  case "$target_mode" in
+    jp|custom) ;;
+    *)
+      echo "Target pool mode must be jp or custom."
+      exit 1
+      ;;
+  esac
+
+  install_dependencies
+
+  install -d -m 755 /usr/local/sbin
+  install -d -m 755 /etc/openvpn
+  install -d -m 755 "$STATE_DIR"
+
+  write_rotator_py
+
+  if [[ "$target_mode" == "jp" ]]; then
+    target_country_codes="JP"
+  else
+    if ! python3 "$ROTATOR_PY" --list-regions; then
+      echo "Retrying VPNGate region listing once..."
+      python3 "$ROTATOR_PY" --list-regions || true
+    fi
+    read -r -p "Enter target country codes (comma-separated, example JP,KR,US): " target_country_codes
+    if [[ -z "$target_country_codes" ]]; then
+      echo "Target country codes are required in custom mode."
+      exit 1
+    fi
+    target_country_codes="$(echo "$target_country_codes" | tr '[:lower:]' '[:upper:]' | tr -d ' ')"
+  fi
+
+  read -r -p "Enter target cities/regions (comma-separated, leave empty for any city): " target_city_keywords
+  target_city_keywords="$(echo "$target_city_keywords" | sed 's/, */,/g')"
 
   read -r -p "Enter IPRegistry API Key: " ipregistry_key
   if [[ -z "$ipregistry_key" ]]; then
@@ -1233,7 +1544,8 @@ install_all() {
     api11|api11.scamalytics.com)
       scam_host="api11.scamalytics.com"
       read -r -p "Enter Scamalytics username: " scam_username
-      read -r -p "Enter Scamalytics key: " scam_key
+      read -rs -p "Enter Scamalytics key: " scam_key
+      echo
       if [[ -z "$scam_username" || -z "$scam_key" ]]; then
         echo "Scamalytics username and key are required when a Scamalytics node is set."
         exit 1
@@ -1242,7 +1554,8 @@ install_all() {
     api12|api12.scamalytics.com)
       scam_host="api12.scamalytics.com"
       read -r -p "Enter Scamalytics username: " scam_username
-      read -r -p "Enter Scamalytics key: " scam_key
+      read -rs -p "Enter Scamalytics key: " scam_key
+      echo
       if [[ -z "$scam_username" || -z "$scam_key" ]]; then
         echo "Scamalytics username and key are required when a Scamalytics node is set."
         exit 1
@@ -1254,7 +1567,8 @@ install_all() {
       ;;
   esac
 
-  read -r -p "Enter API auth token (used by /status and /rotate): " api_token
+  read -rs -p "Enter API auth token (used by /status and /rotate): " api_token
+  echo
   if [[ -z "$api_token" ]]; then
     echo "API auth token is required."
     exit 1
@@ -1267,17 +1581,10 @@ install_all() {
     exit 1
   fi
 
-  install_dependencies
-
-  install -d -m 755 /usr/local/sbin
-  install -d -m 755 /etc/openvpn
-  install -d -m 755 "$STATE_DIR"
-
-  write_rotator_py
   write_api_py
   write_wrapper_bin
   write_uninstall_script
-  write_config_files "$ipregistry_key" "$ipapi_key" "$scam_host" "$scam_username" "$scam_key" "$api_token" "$api_port"
+  write_config_files "$target_mode" "$target_country_codes" "$target_city_keywords" "$ipregistry_key" "$ipapi_key" "$scam_host" "$scam_username" "$scam_key" "$api_token" "$api_port"
 
   init_sys="$(detect_init_system)"
   case "$init_sys" in
@@ -1301,10 +1608,12 @@ install_all() {
   echo "  vpngate rotate"
   echo "  vpngate ip"
   echo "  vpngate logs"
+  echo "  vpngate regions"
+  echo "  vpngate settings"
   echo
   echo "Direct API (port ${api_port}):"
-  echo "  curl -H 'Authorization: Bearer ${api_token}' http://<VPS_IP>:${api_port}/status"
-  echo "  curl -X POST -H 'Authorization: Bearer ${api_token}' http://<VPS_IP>:${api_port}/rotate"
+  echo "  curl -H 'Authorization: Bearer ${api_token}' http://127.0.0.1:${api_port}/status"
+  echo "  curl -X POST -H 'Authorization: Bearer ${api_token}' http://127.0.0.1:${api_port}/rotate"
 }
 
 main() {
